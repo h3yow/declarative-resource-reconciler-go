@@ -95,11 +95,6 @@ func cloneResource(r *api.Resource) *api.Resource {
 func (s *Store) PutDesired(r *api.Resource) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if old, ok := s.desired[r.Key()]; ok && old.Spec != r.Spec {
-		r.Generation = old.Generation + 1
-	} else if r.Generation == 0 {
-		r.Generation = 1
-	}
 	if old, ok := s.desired[r.Key()]; ok && !reflect.DeepEqual(old.Spec, r.Spec) {
 		r.Generation = old.Generation + 1
 	} else if r.Generation == 0 {

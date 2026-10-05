@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -160,10 +161,55 @@ func (r *Reconciler) process(key string, attempts int) (string, error) {
 	if !ok {
 		return "desired resource gone; nothing to reconcile", nil
 	}
+	before := readySummaryOf(res)
+
+	var decision string
+	var err error
 	if res.DeletionTimestamp != nil {
-		return r.reconcileDelete(res, attempts)
+		decision, err = r.reconcileDelete(res, attempts)
+	} else {
+		decision, err = r.reconcileDesired(res, attempts)
 	}
-	return r.reconcileDesired(res, attempts)
+
+	// Relationship fan-out: whenever this pass changed the externally
+	// visible conclusion (or removed the record), wake the resources
+	// whose own evaluation depends on it. This is what lets waiters
+	// continue without any manual re-trigger, and it terminates because
+	// an unchanged summary fans out nothing.
+	after, stillThere := r.store.GetDesired(key)
+	if !stillThere || readySummaryOf(after) != before {
+		for _, dep := range dependentsOf(r.store, key) {
+			r.logf("key=%s changed; waking dependent %s", key, dep)
+			r.queue.Trigger(dep)
+		}
+		if !stillThere {
+			// Deletion completed: upstream resources waiting on this one
+			// during cascade delete must re-evaluate their blockers.
+			for _, up := range res.Spec.DependsOn {
+				r.logf("key=%s deleted; waking upstream %s", key, up)
+				r.queue.Trigger(up)
+			}
+		}
+	}
+	return decision, err
+}
+
+// readySummary is the part of a resource's conclusion that dependents
+// and upstream deleters care about. Timestamps and messages are
+// deliberately excluded so fan-out only happens on real transitions.
+type readySummary struct {
+	phase  api.Phase
+	status string
+	reason api.ConditionReason
+}
+
+func readySummaryOf(res *api.Resource) readySummary {
+	s := readySummary{phase: res.Status.Phase}
+	if c := res.Status.GetCondition(api.ConditionReady); c != nil {
+		s.status = c.Status
+		s.reason = c.Reason
+	}
+	return s
 }
 
 // ReconcileOnce performs one deterministic convergence pass (no queue).
@@ -217,12 +263,20 @@ func (r *Reconciler) reconcileDesired(res *api.Resource, attempts int) (string, 
 		r.store.UpdateDesired(res)
 	}
 
-	// 3) Compute the desired live object.
+	// 3) Dependency gate: a resource with declared dependencies may only
+	// be landed once every dependency is truly Ready. The gate sits
+	// before any live write or side effect, so no interleaving of
+	// triggers can produce a "dependent landed first" intermediate state.
+	if eval := evaluateDeps(r.store, res); eval.verdict != depOK {
+		return r.depHold(res, prevStatus, eval)
+	}
+
+	// 4) Compute the desired live object.
 	want := &state.LiveObject{Replicas: res.Spec.Replicas, Image: res.Spec.Image}
 
 	live, exists := r.store.GetLive(res.Key())
 
-	// 4) Converge the live object.
+	// 5) Converge the live object.
 	var writeErr error
 	var actionMsg string
 	switch {
@@ -278,14 +332,14 @@ func (r *Reconciler) reconcileDesired(res *api.Resource, attempts int) (string, 
 		msg = actionMsg
 	}
 
-	// 5) External side effect: at most once per token value.
+	// 6) External side effect: at most once per token value.
 	if res.Spec.SideEffectToken != "" && res.Spec.SideEffectToken != res.Status.AppliedToken {
 		r.store.CallSideEffect(res.Key(), res.Spec.SideEffectToken)
 		res.Status.AppliedToken = res.Spec.SideEffectToken
 		msg += "; side effect executed for token " + res.Spec.SideEffectToken
 	}
 
-	// 6) Success status; persist only if something actually changed.
+	// 7) Success status; persist only if something actually changed.
 	res.Status.Phase = api.PhaseReady
 	res.Status.ObservedGen = res.Generation
 	res.Status.ReconciledAt = time.Now()
@@ -301,6 +355,63 @@ func (r *Reconciler) reconcileDesired(res *api.Resource, attempts int) (string, 
 		r.store.UpdateDesired(res)
 	}
 	return "converged: " + msg, nil
+}
+
+// depHold records the explainable outcome of a dependency gate that did
+// not pass. Waiting is not a failure and is not retried on a timer: the
+// resource is re-triggered by the fan-out when a dependency changes, so
+// a stuck dependency cannot burn retries. Failed/missing/cyclic are
+// stable, distinguishable conclusions reported as permanent so the queue
+// stops scheduling the key.
+func (r *Reconciler) depHold(res *api.Resource, prev api.Status, eval depEvaluation) (string, error) {
+	deps := strings.Join(eval.blockers, ", ")
+	var cond api.Condition
+	var err error
+	switch eval.verdict {
+	case depWaiting:
+		res.Status.Phase = api.PhasePending
+		cond = api.Condition{
+			Type: api.ConditionReady, Status: conditionFalse,
+			Reason:  api.ReasonDependencyWaiting,
+			Message: "waiting for dependencies to become ready: " + deps,
+			UpdatedAt: time.Now(),
+		}
+	case depFailed:
+		res.Status.Phase = api.PhaseError
+		cond = api.Condition{
+			Type: api.ConditionReady, Status: conditionFalse,
+			Reason:  api.ReasonDependencyFailed,
+			Message: "dependency reached a terminal failure: " + deps,
+			UpdatedAt: time.Now(),
+		}
+		err = api.Permanent(api.ReasonDependencyFailed, cond.Message)
+	case depMissing:
+		res.Status.Phase = api.PhaseError
+		cond = api.Condition{
+			Type: api.ConditionReady, Status: conditionFalse,
+			Reason:  api.ReasonDependencyMissing,
+			Message: "declared dependency does not exist in desired state: " + deps,
+			UpdatedAt: time.Now(),
+		}
+		err = api.Permanent(api.ReasonDependencyMissing, cond.Message)
+	case depCyclic:
+		res.Status.Phase = api.PhaseError
+		cond = api.Condition{
+			Type: api.ConditionReady, Status: conditionFalse,
+			Reason:  api.ReasonDependencyCycle,
+			Message: "dependency declarations form a cycle involving: " + deps,
+			UpdatedAt: time.Now(),
+		}
+		err = api.Permanent(api.ReasonDependencyCycle, cond.Message)
+	}
+	res.Status.SetCondition(cond)
+	if !reflect.DeepEqual(prev, res.Status) {
+		r.store.UpdateDesired(res)
+	}
+	if err != nil {
+		return "failure: " + cond.Message, err
+	}
+	return "waiting: " + cond.Message, nil
 }
 
 // recordObserve mirrors the live object into observed status fields.
@@ -429,6 +540,23 @@ func numberToInt(v any) (int, bool) {
 
 // reconcileDelete keeps the resource until cleanup is done.
 func (r *Reconciler) reconcileDelete(res *api.Resource, attempts int) (string, error) {
+	// Cascade-delete gate: downstream resources that depend on this one
+	// must be cleaned up first. While any of them still exist the
+	// deletion is held in a distinguishable waiting state (no hot retry;
+	// the dependent's own completion fans out a trigger back to us).
+	if blockers := blockingDependents(r.store, res); len(blockers) > 0 {
+		res.Status.Phase = api.PhaseDeleting
+		res.Status.SetCondition(api.Condition{
+			Type: api.ConditionReady, Status: conditionFalse,
+			Reason: api.ReasonDeleteWaitingDependents,
+			Message: "deletion held until dependents are cleaned up: " +
+				strings.Join(blockers, ", "),
+			Retries: attempts, UpdatedAt: time.Now(),
+		})
+		r.store.UpdateDesired(res)
+		return "deletion waiting for dependents: " + strings.Join(blockers, ", "), nil
+	}
+
 	hasFinalizer := false
 	for _, f := range res.Finalizers {
 		if f == r.cfg.FinalizerName {

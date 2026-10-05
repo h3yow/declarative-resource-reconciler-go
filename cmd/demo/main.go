@@ -75,7 +75,71 @@ func main() {
 		logger.Fatalf("resource still present after cleanup completed")
 	}
 	logger.Printf("final counters: %+v", store.Counters())
+
+	// Step 6: multi-resource dependency orchestration.
+	logger.Printf("--- dependency orchestration ---")
+	db, app := "Widget/db", "Widget/app"
+	store.PutDesired(&api.Resource{
+		Kind: "Widget", APIVersion: "v1", Name: "db",
+		Spec: api.Spec{Replicas: 1, Image: "db:1"},
+	})
+	store.PutDesired(&api.Resource{
+		Kind: "Widget", APIVersion: "v1", Name: "app",
+		Spec: api.Spec{Replicas: 2, Image: "app:1", DependsOn: []string{db}},
+	})
+	rec.Start()
+	defer rec.Stop()
+
+	logger.Printf("input: trigger dependent %s BEFORE its dependency %s", app, db)
+	rec.Trigger(app)
+	waitForLog(logger, store, app, api.ReasonDependencyWaiting)
+	logger.Printf("input: trigger dependency %s; dependent must auto-continue", db)
+	rec.Trigger(db)
+	waitForLog(logger, store, db, api.ReasonReady)
+	waitForLog(logger, store, app, api.ReasonReady)
+
+	// Step 7: cascade delete — upstream is held until downstream is gone.
+	logger.Printf("--- cascade delete ---")
+	logger.Printf("input: delete upstream %s while %s still exists", db, app)
+	markDeleting(store, db)
+	rec.Trigger(db)
+	waitForLog(logger, store, db, api.ReasonDeleteWaitingDependents)
+	logger.Printf("input: delete downstream %s; upstream must unwind automatically", app)
+	markDeleting(store, app)
+	rec.Trigger(app)
+	deadline := time.Now().Add(2 * time.Second)
+	for len(store.ListDesired()) > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := len(store.ListDesired()); n > 0 {
+		logger.Fatalf("cascade delete left %d desired records behind", n)
+	}
+	logger.Printf("cascade delete complete; final counters: %+v", store.Counters())
 	logger.Printf("demo finished successfully")
+}
+
+func markDeleting(store *state.Store, key string) {
+	res, ok := store.GetDesired(key)
+	if !ok {
+		return
+	}
+	now := time.Now()
+	res.DeletionTimestamp = &now
+	store.UpdateDesired(res)
+}
+
+func waitForLog(logger *log.Logger, store *state.Store, key string, want api.ConditionReason) {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if res, ok := store.GetDesired(key); ok {
+			if c := res.Status.GetCondition(api.ConditionReady); c != nil && c.Reason == want {
+				logger.Printf("key=%s reached reason=%s msg=%q", key, c.Reason, c.Message)
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	logger.Fatalf("key=%s never reached reason=%s", key, want)
 }
 
 func run(logger *log.Logger, rec *reconcile.Reconciler, store *state.Store, key, label string) {

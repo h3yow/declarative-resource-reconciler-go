@@ -35,6 +35,28 @@ const (
 	ReasonDeleteCleanupWaiting ConditionReason = "DeleteCleanupWaiting"
 	ReasonCleanupComplete      ConditionReason = "CleanupComplete"
 	ReasonReady                ConditionReason = "Ready"
+
+	// Dependency orchestration reasons. Each is a stable, distinguishable
+	// conclusion about the *relationship* layer, never confused with the
+	// resource's own failure reasons above.
+	//
+	// ReasonDependencyWaiting: at least one dependency exists but has not
+	// converged yet. The resource waits (no hot retry loop); it is
+	// re-triggered automatically when a dependency changes.
+	ReasonDependencyWaiting ConditionReason = "WaitingForDependencies"
+	// ReasonDependencyFailed: a dependency reached a terminal failure, so
+	// this resource can never become ready under the current desired
+	// state. Stable conclusion; retries stop.
+	ReasonDependencyFailed ConditionReason = "DependencyFailed"
+	// ReasonDependencyMissing: a referenced dependency does not exist in
+	// the desired state (or can never exist). Stable config explanation.
+	ReasonDependencyMissing ConditionReason = "DependencyMissing"
+	// ReasonDependencyCycle: the dependency declarations form a cycle
+	// involving this resource. Distinguishable configuration problem.
+	ReasonDependencyCycle ConditionReason = "DependencyCycle"
+	// ReasonDeleteWaitingDependents: deletion is held because downstream
+	// resources that depend on this one have not been cleaned up yet.
+	ReasonDeleteWaitingDependents ConditionReason = "DeleteWaitingForDependents"
 )
 
 // Phase is a coarse lifecycle phase stored in status.
@@ -68,6 +90,11 @@ type Spec struct {
 	Replicas        int    `json:"replicas"`
 	Image           string `json:"image"`
 	SideEffectToken string `json:"sideEffectToken,omitempty"`
+	// DependsOn lists keys ("Kind/Name") of other resources in the same
+	// desired-state batch that must be fully Ready before this resource
+	// is allowed to converge. Empty means no orchestration: behavior is
+	// exactly the single-resource semantics.
+	DependsOn []string `json:"dependsOn,omitempty"`
 }
 
 // Status is the observed/result state written by the reconciler.
