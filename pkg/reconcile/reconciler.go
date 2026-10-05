@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -160,10 +161,154 @@ func (r *Reconciler) process(key string, attempts int) (string, error) {
 	if !ok {
 		return "desired resource gone; nothing to reconcile", nil
 	}
-	if res.DeletionTimestamp != nil {
-		return r.reconcileDelete(res, attempts)
+	before := cloneStatus(res.Status)
+
+	var decision string
+	var err error
+	switch {
+	case res.DeletionTimestamp != nil:
+		decision, err = r.reconcileDelete(res, attempts)
+	default:
+		if parked, parkedDecision := r.depGate(res); parked {
+			decision = parkedDecision
+		} else {
+			decision, err = r.reconcileDesired(res, attempts)
+		}
 	}
-	return r.reconcileDesired(res, attempts)
+
+	// Dependency wake-up: whenever this pass changed our observable
+	// state (or removed the record), downstream resources parked on us
+	// must be re-evaluated without any manual re-trigger. Triggers
+	// merge in the queue but are never dropped.
+	after, stillThere := r.store.GetDesired(key)
+	switch {
+	case !stillThere:
+		// Record removed (delete completed): wake both our dependents
+		// and the upstreams we depended on (their delete gate may now
+		// be released).
+		r.wakeDependents(key, res.Spec.DependsOn)
+	case !reflect.DeepEqual(before, after.Status):
+		r.wakeDependents(key, nil)
+	}
+	return decision, err
+}
+
+// cloneStatus deep-copies the status fields the reconciler mutates so a
+// before/after comparison is not fooled by shared slices or maps.
+func cloneStatus(s api.Status) api.Status {
+	cp := s
+	if s.Conditions != nil {
+		cp.Conditions = append([]api.Condition(nil), s.Conditions...)
+	}
+	if s.UnknownFields != nil {
+		cp.UnknownFields = make(map[string]string, len(s.UnknownFields))
+		for k, v := range s.UnknownFields {
+			cp.UnknownFields[k] = v
+		}
+	}
+	return cp
+}
+
+// wakeDependents triggers every desired resource that declared a
+// dependency on key, plus any extra keys (used on delete completion to
+// also wake upstreams). Each woken resource re-reads current state, so
+// merged triggers lose nothing.
+func (r *Reconciler) wakeDependents(key string, extra []string) {
+	targets := map[string]struct{}{}
+	for _, k := range dependentsOf(r.store, key) {
+		targets[k] = struct{}{}
+	}
+	for _, k := range extra {
+		if k != key {
+			targets[k] = struct{}{}
+		}
+	}
+	for k := range targets {
+		r.logf("key=%s observable state changed; waking %s for dependency re-evaluation", key, k)
+		r.queue.Trigger(k)
+	}
+}
+
+// depGate evaluates declared dependencies before any create/update.
+// It returns parked=true when the resource must not converge yet (or
+// ever, for config problems), after recording a stable, distinguishable
+// condition. Parking never returns an error, so the queue does not
+// burn retries: a parked resource is woken by its dependencies' state
+// changes instead.
+func (r *Reconciler) depGate(res *api.Resource) (parked bool, decision string) {
+	if len(res.Spec.DependsOn) == 0 {
+		return false, ""
+	}
+	rep := evaluateDeps(r.store, res)
+	switch {
+	case len(rep.cycle) > 0:
+		msg := fmt.Sprintf("dependency cycle detected: %s; fix the dependsOn declarations", formatCycle(rep.cycle))
+		r.parkCondition(res, api.PhaseError, api.ReasonDependencyCycle, msg)
+		return true, "blocked: " + msg
+	case len(rep.blockers) > 0:
+		missing, failed, waiting := summarizeBlockers(rep.blockers)
+		switch {
+		case missing != "":
+			r.parkCondition(res, api.PhaseError, api.ReasonDependencyMissing, missing)
+			return true, "blocked: " + missing
+		case failed != "":
+			r.parkCondition(res, api.PhaseError, api.ReasonDependencyFailed, failed)
+			return true, "blocked: " + failed
+		default:
+			r.parkCondition(res, api.PhasePending, api.ReasonWaitingForDependency, waiting)
+			return true, "parked: " + waiting
+		}
+	}
+	return false, ""
+}
+
+// summarizeBlockers renders the blocker list, preferring the most
+// severe class: missing (config error) > failed (terminal upstream) >
+// waiting (upstream still converging).
+func summarizeBlockers(blockers []depBlocker) (missing, failed, waiting string) {
+	var miss, fail, wait []string
+	for _, b := range blockers {
+		item := b.key + " (" + b.detail + ")"
+		switch b.verdict {
+		case depMissing:
+			miss = append(miss, item)
+		case depFailed:
+			fail = append(fail, item)
+		default:
+			wait = append(wait, item)
+		}
+	}
+	join := func(items []string, head string) string {
+		if len(items) == 0 {
+			return ""
+		}
+		return fmt.Sprintf("%s: %s", head, strings.Join(items, ", "))
+	}
+	return join(miss, "declared dependencies do not exist"),
+		join(fail, "dependencies terminally failed"),
+		join(wait, "waiting for dependencies to converge")
+}
+
+// parkCondition records a stable parked condition. It is idempotent:
+// when phase/reason/message are unchanged nothing is written, so a
+// re-trigger with unchanged desired and observed state is an observable
+// no-op and never wakes downstream resources spuriously.
+func (r *Reconciler) parkCondition(res *api.Resource, phase api.Phase, reason api.ConditionReason, msg string) {
+	existing := res.Status.GetCondition(api.ConditionReady)
+	if res.Status.Phase == phase && existing != nil &&
+		existing.Status == conditionFalse && existing.Reason == reason &&
+		existing.Message == msg {
+		return
+	}
+	res.Status.Phase = phase
+	res.Status.SetCondition(api.Condition{
+		Type:      api.ConditionReady,
+		Status:    conditionFalse,
+		Reason:    reason,
+		Message:   msg,
+		UpdatedAt: time.Now(),
+	})
+	r.store.UpdateDesired(res)
 }
 
 // ReconcileOnce performs one deterministic convergence pass (no queue).
@@ -439,6 +584,17 @@ func (r *Reconciler) reconcileDelete(res *api.Resource, attempts int) (string, e
 	if !hasFinalizer {
 		r.store.DeleteDesired(res.Key())
 		return "no finalizer; desired record removed", nil
+	}
+
+	// Dependency-aware deletion: downstream resources that still exist
+	// (even if they are themselves deleting) keep this upstream alive.
+	// Parking here returns no error, so there is no retry spin; the
+	// resource is woken when a dependent's record is removed.
+	if deps := dependentsOf(r.store, res.Key()); len(deps) > 0 {
+		msg := fmt.Sprintf("waiting for downstream resources to be cleaned up first: %s",
+			strings.Join(deps, ", "))
+		r.parkCondition(res, api.PhaseDeleting, api.ReasonDeleteWaitingDependents, msg)
+		return "deletion parked: " + msg, nil
 	}
 
 	if err := r.store.Cleanup(res.Key()); err != nil {

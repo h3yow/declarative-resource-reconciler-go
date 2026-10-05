@@ -16,7 +16,8 @@ same, *explainable* conclusion regardless of trigger ordering.
 | `pkg/api/codec.go` | JSON decode/encode that preserves unknown and migrates old fields |
 | `pkg/state/store.go` | In-memory simulation: desired records, live objects, side-effect ledger, fault injection |
 | `pkg/reconcile/queue.go` | Per-key serialized queue with at-least-once delivery and retry accounting |
-| `pkg/reconcile/reconciler.go` | Convergence, idempotency, drift correction, compatibility, deletion cleanup |
+| `pkg/reconcile/deps.go` | Dependency evaluation, cycle detection and reverse (dependent) lookup |
+| `pkg/reconcile/reconciler.go` | Convergence, idempotency, drift correction, compatibility, dependency gating, deletion cleanup |
 | `cmd/demo/main.go` | Runnable end-to-end walkthrough |
 
 ## Reconciliation semantics
@@ -53,7 +54,64 @@ not on the trigger payload.
 Conditions are intentionally *distinguishable*: `Ready`,
 `TransientFailure`, `PermanentFailure`, `RecreatedAfterDrift`,
 `DriftCorrected`, `MissingFieldRebuilt`, `UnknownFieldsPreserved`,
-`LegacyFieldMigrated`, `DeleteCleanupWaiting`, `CleanupComplete`.
+`LegacyFieldMigrated`, `DeleteCleanupWaiting`, `CleanupComplete`,
+`WaitingForDependency`, `DependencyFailed`, `DependencyMissing`,
+`DependencyCycle`, `DeleteWaitingDependents`.
+
+## Dependency orchestration
+
+`spec.dependsOn` lists keys (`Kind/Name`) of other resources **in the
+same desired set** that must truly reach their desired state (Ready
+condition true at the current generation) before this resource is
+allowed to land. Resources with no `dependsOn` behave exactly as
+before — the gate is skipped entirely.
+
+- **Ordering under any trigger pattern.** A dependent resource never
+  creates or writes its managed object while a dependency is unready —
+  regardless of trigger order, duplication or concurrency. Repeated
+  triggers of an unchanged, already-converged resource remain
+  observable no-ops (no duplicate creates, writes or side effects).
+- **Waiting is parked, not retried.** While a dependency is still
+  converging (or transiently failing), the dependent parks with
+  `Pending` / `WaitingForDependency` — clearly distinct from its own
+  `TransientFailure`. Parking consumes **no** retries and **no**
+  backoff slots: the resource is woken automatically when a
+  dependency's observable state changes, so a healed dependency
+  resumes its dependents with no manual re-trigger, and triggers
+  merged while parked are honored by the queue's dirty-set semantics.
+- **Terminal dependency failure.** If a dependency reaches
+  `PermanentFailure` (including retries exhausted), the dependent
+  records `Error` / `DependencyFailed` — a stable conclusion,
+  distinguishable from the dependency's own failure — and stops. No
+  retry spin; if the dependency later recovers (e.g. its spec is
+  fixed), the dependent is woken and re-evaluated.
+- **Missing dependency.** Declaring a dependency on a key that does
+  not exist in the desired set yields `Error` / `DependencyMissing`
+  with the offending keys listed. Nothing crashes, nothing hangs, no
+  object is created. If the dependency is declared later and
+  converges, the dependent recovers automatically.
+- **Cycles.** Dependency declarations that form a cycle (including
+  self-references) are detected by graph walk and reported as `Error`
+  / `DependencyCycle` with the cycle path (e.g. `A -> B -> A`) on
+  every member. No resource in the cycle is created and the loop
+  terminates: parked conditions are idempotent, so the wake-up
+  cascade cannot spin.
+
+## Cascading deletion
+
+Deletion respects the dependency direction in reverse: **an upstream
+resource is not released while any downstream resource that depends on
+it still exists.**
+
+- While dependents (even ones already deleting themselves) remain in
+  the desired set, the upstream's deletion parks with `Deleting` /
+  `DeleteWaitingDependents` — distinct from `DeleteCleanupWaiting`
+  (its own cleanup) — and its live object stays put.
+- When a dependent's record is removed, the upstream is woken
+  automatically and resumes the ordinary finalizer cleanup path
+  (`DeleteCleanupWaiting` → `CleanupComplete` → record removed).
+- Each resource's delete is counted exactly once in the ledger and no
+  live objects are left behind.
 
 ## Retry rules
 
@@ -93,10 +151,32 @@ therefore converge to exactly one create and one side effect.
 ```sh
 go build ./...
 go vet ./...
-go test -race -count=1 ./...      # unit + concurrency/retry/delete tests
+go test -race -count=1 ./...      # unit + concurrency/retry/delete/dependency tests
 go run ./cmd/demo                 # end-to-end scenario walkthrough
 ```
 
 The tests assert side-effect counts (`Creates/Updates/Deletes/SideCalls`),
 final phases and the distinct condition reasons, and their `-v` logs print
-the trigger inputs, retry attempts and the basis for each decision.
+the trigger inputs, retry attempts and the basis for each decision. The
+orchestration tests (`pkg/reconcile/orchestration_test.go`) additionally
+log which dependency a resource is parked on and which state change woke
+it, e.g.:
+
+```sh
+go test -race -count=1 -v -run 'TestDependency|TestCascading' ./pkg/reconcile/
+```
+
+## Compatibility scope
+
+- **Objects without `dependsOn`** take the exact same code path as
+  before this feature: same reasons, same counters, same retry and
+  deletion behavior (covered by the pre-existing test suite).
+- **A dependency on a nonexistent key** is a stable configuration
+  conclusion (`DependencyMissing`), never a crash or a deadlock; the
+  dependent recovers automatically if the key appears and converges.
+- **Cyclic declarations** are reported as `DependencyCycle` on every
+  cycle member with the cycle path; no resource in the cycle converges
+  and the reconciler keeps serving all other keys normally.
+- **Deleting an upstream with live dependents** parks it in
+  `DeleteWaitingDependents` until the dependents are gone; deleting a
+  resource with no dependents is unchanged from the original rules.

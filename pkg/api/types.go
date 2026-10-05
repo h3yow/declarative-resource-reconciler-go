@@ -35,6 +35,28 @@ const (
 	ReasonDeleteCleanupWaiting ConditionReason = "DeleteCleanupWaiting"
 	ReasonCleanupComplete      ConditionReason = "CleanupComplete"
 	ReasonReady                ConditionReason = "Ready"
+
+	// Dependency orchestration reasons. All are distinguishable from the
+	// resource's own failures (TransientFailure/PermanentFailure).
+
+	// ReasonWaitingForDependency: at least one dependency exists but has
+	// not reached its desired state yet. The resource parks here without
+	// burning retries and resumes automatically when the dependency
+	// converges.
+	ReasonWaitingForDependency ConditionReason = "WaitingForDependency"
+	// ReasonDependencyFailed: a dependency reached a terminal failure, so
+	// this resource reports a stable, distinct conclusion and stops.
+	ReasonDependencyFailed ConditionReason = "DependencyFailed"
+	// ReasonDependencyMissing: a declared dependency does not exist in
+	// the desired set (or vanished). Stable configuration problem.
+	ReasonDependencyMissing ConditionReason = "DependencyMissing"
+	// ReasonDependencyCycle: the dependency declarations form a cycle.
+	// Stable configuration problem, reported instead of hanging.
+	ReasonDependencyCycle ConditionReason = "DependencyCycle"
+	// ReasonDeleteWaitingDependents: deletion is blocked because
+	// downstream resources that depend on this one are not cleaned up
+	// yet. Distinct from DeleteCleanupWaiting (own cleanup).
+	ReasonDeleteWaitingDependents ConditionReason = "DeleteWaitingDependents"
 )
 
 // Phase is a coarse lifecycle phase stored in status.
@@ -64,10 +86,16 @@ type Condition struct {
 // Replicas is the key desired field. SideEffectToken models an
 // external side effect that must run at most once per token value:
 // changing the token re-runs it, repeating the same value is a no-op.
+//
+// DependsOn lists keys ("Kind/Name") of other resources in the same
+// desired set that must reach their desired state before this resource
+// is allowed to converge. Empty means no orchestration: behavior is
+// identical to a resource that never declared dependencies.
 type Spec struct {
-	Replicas        int    `json:"replicas"`
-	Image           string `json:"image"`
-	SideEffectToken string `json:"sideEffectToken,omitempty"`
+	Replicas        int      `json:"replicas"`
+	Image           string   `json:"image"`
+	SideEffectToken string   `json:"sideEffectToken,omitempty"`
+	DependsOn       []string `json:"dependsOn,omitempty"`
 }
 
 // Status is the observed/result state written by the reconciler.
